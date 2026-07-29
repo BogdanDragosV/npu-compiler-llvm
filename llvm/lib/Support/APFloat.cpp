@@ -81,6 +81,17 @@ constexpr fltSemantics APFloatBase::semFloat8E8M0FNU = {
     false,
     false};
 
+constexpr fltSemantics APFloatBase::semFloat8E5M3FNU = {
+    16,
+    -14,
+    4,
+    8,
+    fltNonfiniteBehavior::NanOnly,
+    fltNanEncoding::AllOnes,
+    true,
+    false,
+    false};
+
 constexpr fltSemantics APFloatBase::semFloat6E3M2FN = {
     4, -2, 3, 6, fltNonfiniteBehavior::FiniteOnly};
 constexpr fltSemantics APFloatBase::semFloat6E2M3FN = {
@@ -128,6 +139,8 @@ const llvm::fltSemantics &APFloatBase::EnumToSemantics(Semantics S) {
     return FloatTF32();
   case S_Float8E8M0FNU:
     return Float8E8M0FNU();
+  case S_Float8E5M3FNU:
+    return Float8E5M3FNU();
   case S_Float6E3M2FN:
     return Float6E3M2FN();
   case S_Float6E2M3FN:
@@ -174,6 +187,8 @@ APFloatBase::SemanticsToEnum(const llvm::fltSemantics &Sem) {
     return S_FloatTF32;
   else if (&Sem == &llvm::APFloat::Float8E8M0FNU())
     return S_Float8E8M0FNU;
+  else if (&Sem == &llvm::APFloat::Float8E5M3FNU())
+    return S_Float8E5M3FNU;
   else if (&Sem == &llvm::APFloat::Float6E3M2FN())
     return S_Float6E3M2FN;
   else if (&Sem == &llvm::APFloat::Float6E2M3FN())
@@ -293,7 +308,7 @@ exponentNaN(const fltSemantics &semantics) {
   if (semantics.nonFiniteBehavior == fltNonfiniteBehavior::NanOnly) {
     if (semantics.nanEncoding == fltNanEncoding::NegativeZero)
       return exponentZero(semantics);
-    if (semantics.hasSignedRepr)
+    if (semantics.hasSignedRepr || semantics.precision > 1)
       return semantics.maxExponent;
   }
   return semantics.maxExponent + 1;
@@ -3508,8 +3523,7 @@ APInt IEEEFloat::convertIEEEFloatToAPInt() const {
       integerPart{1} << (trailing_significand_bits % integerPartWidth);
   constexpr uint64_t significand_mask = integer_bit - 1;
   constexpr unsigned int exponent_bits =
-      trailing_significand_bits ? (S.sizeInBits - 1 - trailing_significand_bits)
-                                : S.sizeInBits;
+      S.sizeInBits - (S.hasSignedRepr ? 1 : 0) - trailing_significand_bits;
   static_assert(exponent_bits < 64);
   constexpr uint64_t exponent_mask = (uint64_t{1} << exponent_bits) - 1;
 
@@ -3634,6 +3648,11 @@ APInt IEEEFloat::convertFloat8E8M0FNUAPFloatToAPInt() const {
   return convertIEEEFloatToAPInt<APFloatBase::semFloat8E8M0FNU>();
 }
 
+APInt IEEEFloat::convertFloat8E5M3FNUAPFloatToAPInt() const {
+  assert(partCount() == 1);
+  return convertIEEEFloatToAPInt<APFloatBase::semFloat8E5M3FNU>();
+}
+
 APInt IEEEFloat::convertFloat6E3M2FNAPFloatToAPInt() const {
   assert(partCount() == 1);
   return convertIEEEFloatToAPInt<APFloatBase::semFloat6E3M2FN>();
@@ -3700,6 +3719,9 @@ APInt IEEEFloat::bitcastToAPInt() const {
 
   if (semantics == (const llvm::fltSemantics *)&APFloatBase::semFloat8E8M0FNU)
     return convertFloat8E8M0FNUAPFloatToAPInt();
+
+  if (semantics == (const llvm::fltSemantics *)&APFloatBase::semFloat8E5M3FNU)
+    return convertFloat8E5M3FNUAPFloatToAPInt();
 
   if (semantics == (const llvm::fltSemantics *)&APFloatBase::semFloat6E3M2FN)
     return convertFloat6E3M2FNAPFloatToAPInt();
@@ -3835,6 +3857,11 @@ void IEEEFloat::initFromFloat8E8M0FNUAPInt(const APInt &api) {
   category = fcNormal;
   exponent = myexponent - 127; // 127 is bias
 }
+
+void IEEEFloat::initFromFloat8E5M3FNUAPInt(const APInt &api) {
+  initFromIEEEAPInt<APFloatBase::semFloat8E5M3FNU>(api);
+}
+
 template <const fltSemantics &S>
 void IEEEFloat::initFromIEEEAPInt(const APInt &api) {
   assert(api.getBitWidth() == S.sizeInBits);
@@ -3845,7 +3872,7 @@ void IEEEFloat::initFromIEEEAPInt(const APInt &api) {
   constexpr unsigned int stored_significand_parts =
       partCountForBits(trailing_significand_bits);
   constexpr unsigned int exponent_bits =
-      S.sizeInBits - 1 - trailing_significand_bits;
+      S.sizeInBits - (S.hasSignedRepr ? 1 : 0) - trailing_significand_bits;
   static_assert(exponent_bits < 64);
   constexpr uint64_t exponent_mask = (uint64_t{1} << exponent_bits) - 1;
   constexpr int bias = -(S.minExponent - 1);
@@ -3867,7 +3894,9 @@ void IEEEFloat::initFromIEEEAPInt(const APInt &api) {
   initialize(&S);
   assert(partCount() == mysignificand.size());
 
-  sign = static_cast<unsigned int>(last_word >> ((S.sizeInBits - 1) % 64));
+  sign = S.hasSignedRepr
+             ? static_cast<unsigned int>(last_word >> ((S.sizeInBits - 1) % 64))
+             : 0;
 
   bool all_zero_significand = llvm::all_of(mysignificand, equal_to(0));
 
@@ -4016,6 +4045,8 @@ void IEEEFloat::initFromAPInt(const fltSemantics *Sem, const APInt &api) {
     return initFromFloatTF32APInt(api);
   if (Sem == &APFloatBase::semFloat8E8M0FNU)
     return initFromFloat8E8M0FNUAPInt(api);
+  if (Sem == &APFloatBase::semFloat8E5M3FNU)
+    return initFromFloat8E5M3FNUAPInt(api);
   if (Sem == &APFloatBase::semFloat6E3M2FN)
     return initFromFloat6E3M2FNAPInt(api);
   if (Sem == &APFloatBase::semFloat6E2M3FN)
@@ -6081,7 +6112,8 @@ bool APFloatBase::isValidArbitraryFPFormat(StringRef Format) {
   static constexpr StringLiteral ValidFormats[] = {
       "Float8E5M2",     "Float8E5M2FNUZ",    "Float8E4M3",  "Float8E4M3FN",
       "Float8E4M3FNUZ", "Float8E4M3B11FNUZ", "Float8E3M4",  "Float8E8M0FNU",
-      "Float6E3M2FN",   "Float6E2M3FN",      "Float4E2M1FN"};
+      "Float6E3M2FN",   "Float6E2M3FN",      "Float4E2M1FN",
+      "Float8E5M3FNU"};
   return llvm::is_contained(ValidFormats, Format);
 }
 
